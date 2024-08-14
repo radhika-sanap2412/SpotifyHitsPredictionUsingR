@@ -1,0 +1,407 @@
+---
+title: "ml proj"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+```{r}
+library(caret)
+library(randomForest)
+library(ggplot2)
+library(corrplot)
+library(e1071)
+library(pROC)
+library(class)
+```
+##Import data
+```{r}
+# import data and ensure columns are correct data types
+# also set desired levels for categorical predictors
+# date/time info is converted to numeric (number of seconds since 1/1/1970) 
+
+data = read.csv('spotify-2023.csv', na.strings='')
+data = data[-c(1,2)]
+df = data[-c(575),]
+df = na.omit(df)
+df$mode = as.factor(df$mode)
+df$key = as.factor(df$key)
+df$in_deezer_playlists = as.integer(df$in_apple_playlists)
+df$streams = as.numeric(df$streams)
+df$in_shazam_charts = as.numeric(gsub(",", "", df$in_shazam_charts))
+df$Date = as.Date(with(df, paste(released_year, released_month, released_day,sep="-")),"%Y-%m-%d")
+df$Date = as.numeric(df$Date)
+df = subset(df, select = -c(2,3,4))
+df$in_spotify_charts[df$in_spotify_charts == 0] = "flop"
+df$in_spotify_charts[df$in_spotify_charts != "flop"] = "hit"
+df$in_spotify_charts = factor(df$in_spotify_charts, levels = c("hit","flop"))
+
+```
+
+## Visualize data
+```{r}
+# Visualise correlations between predictors
+
+numeric_vars = df[sapply(df, is.numeric)]
+cor_matrix = cor(numeric_vars)
+
+# Plot correlation matrix
+corrplot(cor_matrix, method = "circle", tl.col = "black", tl.srt = 45)
+
+```
+
+# Data standardization function
+```{r}
+## scale data
+# test data is scaled based on training data 
+
+scale_data = function(train, test) {
+  train_scale = sapply( train[,-3], as.numeric )
+  test_scale = sapply( test[,-3], as.numeric )
+  train_scale = as.data.frame(train_scale)
+  test_scale = as.data.frame(test_scale)
+  train_scale = scale(train_scale)
+  attributes(train_scale)
+  test_scaled = as.data.frame(scale(test_scale, center=attr(train_scale, "scaled:center"), scale=attr(train_scale, "scaled:scale")))
+  train_scaled = as.data.frame(train_scale)
+  train_scaled$in_spotify_charts = train$in_spotify_charts
+  test_scaled$in_spotify_charts = test$in_spotify_charts
+  return(list("train" = train_scaled, "test" = test_scaled))
+}
+```
+
+## Step functions and cross validation functions for finding optimal model settings/parameters
+```{r}
+# find best predictor set for linear regression
+
+cv_lin_regression = function (train) {
+  # only intercept
+  lin1 = lm(streams ~ 1, data = train)
+  
+  # all predictors
+  linfull = lm(streams ~ ., data = train)
+  # find optimal combination of predictors
+  final_linm = step(lin1, scope=list(upper=linfull), trace=0)
+  return(final_linm)
+}
+```
+
+```{r}
+# find best predictor set for logistic regression
+
+cv_log_classification = function (train) {
+  # only intercept
+  log1 = glm(in_spotify_charts ~ 1, data = train, family = binomial(logit))
+  
+  # all predictors
+  logfull = glm(in_spotify_charts ~ ., data = train, family = binomial)
+  # find optimal combination of predictors
+  final_logm = step(log1, scope=list(upper=logfull), direction="both", trace=0)
+  return(final_logm)
+}
+```
+
+```{r}
+# cross validation random forest regression
+
+cv_rf = function(train) {
+  
+  control = trainControl(method='repeatedcv',
+  number=10,
+  repeats=1,
+  search='grid')
+  tunegrid = expand.grid(.mtry = (1:19))
+  rf_gridsearch = train(streams ~ .,
+  data = train,
+  method = 'rf',
+  metric = 'RMSE',
+  tuneGrid = tunegrid,
+  trControl = control)
+  return(rf_gridsearch)
+}
+```
+
+```{r}
+# cross validation random forest classification
+
+cv_rf_classification = function(train) {
+  control = trainControl(method='repeatedcv',
+  number=10,
+  repeats=1,
+  search='grid',
+  summaryFunction=twoClassSummary,   # Use AUC to pick the best model
+  classProbs=TRUE)
+  tunegrid = expand.grid(.mtry = (1:19))
+  rf_gridsearch = train(in_spotify_charts ~.,
+  data = train,
+  method = 'rf',
+  metric = 'ROC',
+  tuneGrid = tunegrid,
+  trControl = control)
+  return(rf_gridsearch)
+}
+```
+
+```{r}
+# cross validation svm regression
+
+cv_svm_streams = function(train) {
+  svm_gridsearch = tune(svm,
+                    streams ~ .,
+                    data = train,
+                    ranges = list(cost = c(0.001,0.01,0.1, 1,5,10,100), kernel = c('linear', 'poly', 'radial'), gamma=c(0.0001, 0.001,0.01,0.1, 1)),
+                    tunecontrol = tune.control(sampling = "cross", cross = 10))
+  
+  return(svm_gridsearch)
+}
+```
+
+```{r}
+# cross validation svm classification
+
+cv_svm_classification = function(train) {
+  svm_gridsearch = tune(svm,
+                    in_spotify_charts ~ .,
+                    data = train,
+                    type = 'C-classification',
+                    ranges = list(cost = c(0.001,0.01,0.1, 1,5,10,100), kernel = c('linear', 'poly', 'radial'), gamma= c(0.0001, 0.001,0.01,0.1, 1)),
+                    tunecontrol = tune.control(sampling = "cross", cross = 10))
+  
+  return(svm_gridsearch)
+}
+```
+
+```{r}
+# cross validation knn classification
+
+cv_knn_classification = function(train) {
+  control = trainControl(method='repeatedcv',
+  number=10,
+  repeats=1,
+  search='grid',
+  summaryFunction=twoClassSummary,   # Use AUC to pick the best model
+  classProbs=TRUE)
+  tunegrid = expand.grid(k = c(1,10,50,100,200)) 
+  rf_gridsearch = train(in_spotify_charts ~.,
+  data = train,
+  method = 'knn',
+  metric = 'ROC',
+  tuneGrid = tunegrid,
+  trControl = control)
+  return(rf_gridsearch)
+}
+```
+
+```{r}
+# cross validation knn regresssion
+
+cv_knn_regression = function(train) {
+  control = trainControl(method='repeatedcv',
+  number=10,
+  repeats=1,
+  search='grid')
+  tunegrid = expand.grid(k=c(1,10,50,100,200)) 
+  rf_gridsearch = train(streams~.,
+  data = train,
+  method = 'knn',
+  metric = 'RMSE',
+  tuneGrid = tunegrid,
+  trControl = control)
+  return(rf_gridsearch)
+}
+```
+
+## Run experiments
+```{r}
+# automate running experiments for all model types and both machine learning tasks
+# all models use same train/test split for each trial (but train/test splits change each experiment)
+# record results for analysis
+
+cols = c("lin_mse", "rf_mse", "svm_mse", "knn_mse") 
+results_streams = data.frame(matrix(nrow = 0, ncol = length(cols))) 
+colnames(results_streams) = cols
+
+cols = c("rf_auc", "svm_auc", "log_auc", "knn_auc") 
+results_hits = data.frame(matrix(nrow = 0, ncol = length(cols))) 
+colnames(results_hits) = cols
+
+cols = c("rf_reg", "rf_class", "svm_reg", "svm_class", "knn_reg", "knn_class", "linear", "logistic") 
+results_params = data.frame(matrix(nrow = 0, ncol = length(cols))) 
+colnames(results_params) = cols
+
+# increase range to run more experiments
+for (n in 1:15){
+  print("#######################")
+  sample_index = sample(seq_len(nrow(df)), size = 0.7 * nrow(df))
+  train = df[sample_index, ]
+  test = df[-sample_index, ]
+  rescaled_data = scale_data(train,test)
+  train_scaled = rescaled_data$train
+  test_scaled = rescaled_data$test
+  
+  # linear regression 
+  best_lin_regression = cv_lin_regression(train_scaled)
+  lin_best = list(colnames(best_lin_regression$model))
+  lin_model = lm(best_lin_regression$terms, data = train_scaled)
+  lin_classy_pred = predict(lin_model, test_scaled[-3])
+  lin_y_pred = predict(lin_model, newdata = test_scaled[-3])
+  se_lin = (lin_y_pred - test_scaled[3])^2
+  mse_lin = mean(se_lin$streams)
+
+  # knn classification
+  knn_class_best = cv_knn_classification(train_scaled)$bestTune[,1]
+  grid = expand.grid(k = c(knn_class_best))
+  knn_classification_model = train(in_spotify_charts ~., data= train_scaled, method="knn", tuneGrid=grid)
+  knn_classy_pred = predict(knn_classification_model, newdata=test_scaled[-20], type="prob")
+  knn_roc_curve = roc(response = test$in_spotify_charts,
+               predictor = knn_classy_pred[,1],
+               levels = c("hit", "flop"))
+  auc_knn = knn_roc_curve$auc
+  print(ggroc(knn_roc_curve, legacy.axes = TRUE) + labs(x = 'False-positive rate', y = 'True-positive rate', title = 'Simulated ROC curve (KNN)'))
+
+ # knn regression
+  knn_best = cv_knn_regression(train_scaled)$bestTune[,1]
+  grid = expand.grid(k = c(knn_best))
+  knn_model = train(streams ~., data= train_scaled, method="knn", tuneGrid=grid)
+  knn_y_pred = predict(knn_model, newdata = test_scaled[-3])
+  se_knn = (knn_y_pred - test_scaled[3])^2
+  mse_knn = mean(se_knn$streams)
+  
+  # logistic regression (classification)
+  best_log_classification = cv_log_classification(train)
+  log_best = list(colnames(best_log_classification$model))
+  logistic_classification_model = glm(best_log_classification$terms, data = train_scaled,
+                      family = binomial)
+  log_classy_pred = predict(logistic_classification_model, test_scaled[-20])
+  log_roc_curve = roc(response = test$in_spotify_charts,
+               predictor = log_classy_pred,
+               levels = c("hit", "flop"))
+  auc_log = log_roc_curve$auc
+  print(ggroc(log_roc_curve, legacy.axes = TRUE) + labs(x = 'False-positive rate', y = 'True-positive rate', title = 'Simulated ROC curve (logistic)'))
+
+  # random forest regression
+  rf_best = cv_rf(train)$bestTune[,1]
+  rf_model = randomForest(streams~., data = train_scaled, mtry=rf_best)
+  rf_y_pred = predict(rf_model, newdata = test_scaled[-3])
+  se_rf = (rf_y_pred - test_scaled[3])^2
+  mse_rf = mean(se_rf$streams)
+
+  # random forest classification
+  rf_class_best = cv_rf_classification(train)$bestTune[,1]
+  rf_classification_model = randomForest(in_spotify_charts ~., data = train_scaled, mtry=rf_class_best)
+  print(rf_classification_model)
+  rf_classy_pred = predict(rf_classification_model, newdata=test_scaled[-20], type="prob")
+  rf_roc_curve = roc(response = test$in_spotify_charts,
+               predictor = rf_classy_pred[,1],
+               levels = c("hit", "flop"))
+  auc_rf = rf_roc_curve$auc
+  print(ggroc(rf_roc_curve, legacy.axes = TRUE) + labs(x = 'False-positive rate', y = 'True-positive rate', title = 'Simulated ROC curve (RF)'))
+
+  # svm regression
+  svm_model_streams = cv_svm_streams(train_scaled)
+  reg_cost = svm_model_streams$best.parameters[,1]
+  reg_kernel = svm_model_streams$best.parameters[,2]
+  reg_kern = as.character(svm_model_streams$best.parameters[1,2])
+  reg_kern = reg_kern[1]
+  reg_gamma = svm_model_streams$best.parameters[,3]
+  svm_model = svm(streams ~ ., data = train_scaled, kernel = reg_kernel, cost = reg_cost, gamma= reg_gamma)
+  svm_y_pred = predict(svm_model, newdata=test_scaled[-3])
+  se_svm = (svm_y_pred - test_scaled[3])^2
+  mse_svm = mean(se_svm$streams)
+  
+  # svm classification
+  svm_model_classification = cv_svm_classification(train_scaled)
+  class_cost = svm_model_classification$best.parameters[,1]
+  class_kernel = svm_model_classification$best.parameters[,2]
+  class_kern = as.character(svm_model_streams$best.parameters[1,2])
+  class_kern = class_kern[1]
+  class_gamma = svm_model_classification$best.parameters[,3]
+  svm_classification_model = svm(in_spotify_charts ~., data = train_scaled, kernel = class_kernel, cost = class_cost, gamma= class_gamma, type = 'C-classification', probability = TRUE)
+  svm_classy_pred = predict(svm_classification_model, newdata=test_scaled[-20], probability=TRUE)
+  svm_roc_curve = roc(response = test$in_spotify_charts,
+               predictor = attributes(svm_classy_pred)$probabilities[,2],
+               levels = c("hit", "flop"))
+  auc_svm = svm_roc_curve$auc
+  print(ggroc(svm_roc_curve, legacy.axes = TRUE) + labs(x = 'False-positive rate', y = 'True-positive rate', title = 'Simulated ROC curve (SVM)'))
+  l1 = list(reg_cost, reg_kern, reg_gamma)
+  l2 = list(class_cost, class_kern, class_gamma)
+  
+  ## record results
+  
+  # MSE results
+  results_streams[nrow(results_streams) + 1,] = list(mse_lin, mse_rf, mse_svm, mse_knn)
+  
+  # AUC results
+  results_hits[nrow(results_hits) + 1,] = list(auc_rf, auc_svm, auc_log, auc_knn)
+  
+  # Best models from cross-validation
+  results_params[nrow(results_params) + 1,] = list(rf_best,
+                                                   rf_class_best,
+                                                   list(l1),
+                                                   list(l2),
+                                                   knn_best,
+                                                   knn_class_best,
+                                                   lin_best,
+                                                   log_best
+                                                   ) 
+}
+```
+
+```{r}
+# as columns contain lists, need to convert to string for exporting
+results_params_str = apply(results_params,2,as.character)
+```
+
+```{r}
+## For exporting results, uncomment to run
+
+# write.csv(results_hits,file='~/Desktop/stats A/results_hitsfinal.csv', row.names=FALSE)
+# write.csv(results_streams,file='~/Desktop/stats A/results_streamsfinal.csv', row.names=FALSE)
+# write.csv(results_params_str,file='~/Desktop/stats A/results_paramsfinal.csv', row.names=FALSE)
+```
+
+```{r}
+rf_mse_mean = mean(results_streams$rf_mse) 
+svm_mse_mean = mean(results_streams$svm_mse) 
+knn_mse_mean = mean(results_streams$knn_mse) 
+lin_reg_mse_mean = mean(results_streams$lin_mse) 
+
+rf_mse_sd = sd(results_streams$rf_mse) / sqrt(nrow(results_streams))
+svm_mse_sd = sd(results_streams$svm_mse) / sqrt(nrow(results_streams))
+knn_mse_sd = sd(results_streams$knn_mse) / sqrt(nrow(results_streams))
+lin_reg_mse_sd = sd(results_streams$lin_mse) / sqrt(nrow(results_streams))
+
+rf_auc_mean = mean(results_hits$rf_auc) 
+svm_auc_mean = mean(results_hits$svm_auc) 
+knn_auc_mean = mean(results_hits$knn_auc) 
+log_auc_mean = mean(results_hits$log_auc)
+
+rf_auc_sd = sd(results_hits$rf_auc) / sqrt(nrow(results_hits))
+svm_auc_sd = sd(results_hits$svm_auc) / sqrt(nrow(results_hits))
+knn_auc_sd = sd(results_hits$knn_auc) / sqrt(nrow(results_hits))
+log_auc_sd = sd(results_hits$log_auc) / sqrt(nrow(results_hits))
+
+summary_results = data.frame(mse_mean = c(rf_mse_mean, svm_mse_mean, knn_mse_mean, lin_reg_mse_mean),
+                             mse_sd = c(rf_mse_sd, svm_mse_sd, knn_mse_sd, lin_reg_mse_sd),
+                             auc_mean = c(rf_auc_mean, svm_auc_mean, knn_auc_mean, log_auc_mean),
+                             auc_sd = c(rf_auc_sd, svm_auc_sd, knn_auc_sd, log_auc_sd),
+                             model = c('rf', 'svm', 'knn', 'lin. reg.'))
+
+```
+
+```{r}
+# Visualise results
+
+ggplot(summary_results) +
+    geom_bar( aes(x=model, y=mse_mean, fill=model), stat="identity", alpha=0.7) +
+    geom_errorbar( aes(x=model, ymin=mse_mean - mse_sd, ymax=mse_mean + mse_sd), width=0.4, colour="black", alpha=0.5, size=1.3)
+
+summary_results$model = c('rf', 'svm', 'knn', 'logistic. reg.')
+
+ggplot(summary_results) +
+    geom_bar( aes(x=model, y=auc_mean, fill=model), stat="identity", alpha=0.7) +
+    geom_errorbar( aes(x=model, ymin=auc_mean - auc_sd, ymax=auc_mean + auc_sd), width=0.4, colour="black", alpha=0.5, size=1.3)
+
+```
